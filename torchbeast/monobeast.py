@@ -252,6 +252,8 @@ def learn(
 
         discounts = (~batch["done"]).float() * flags.discounting
 
+
+        print(bootstrap_value.shape)
         vtrace_returns = vtrace.from_logits(
             behavior_policy_logits=batch["policy_logits"],
             target_policy_logits=learner_outputs["policy_logits"],

@@ -20,8 +20,11 @@ import time
 
 import numpy as np
 import libtorchbeast
-from torchbeast import atari_wrappers
-
+from torchbeast import wrappers
+import gym
+# from meltingpot.python import substrate
+# from ml_collections import config_dict
+# from torchbeast.meltingpot_wrappers import MeltingPotEnv
 
 # yapf: disable
 parser = argparse.ArgumentParser(description='Remote Environment Server')
@@ -46,16 +49,27 @@ class Env:
         return frame, 0.0, False, {}  # First three mandatory.
 
 
+# def create_meltingpot_env(substrate_name):
+
+#     env_config = substrate.get_config(substrate_name)
+
+#     env = substrate.build(config_dict.ConfigDict(env_config))
+#     env = MeltingPotEnv(env)
+#     return env
+
+
 def create_env(env_name, lock=threading.Lock()):
-    with lock:  # Atari isn't threadsafe at construction time.
-        return atari_wrappers.wrap_pytorch(
-            atari_wrappers.wrap_deepmind(
-                atari_wrappers.make_atari(env_name),
-                clip_rewards=False,
-                frame_stack=True,
-                scale=False,
-            )
-        )
+
+    wrp = (
+        wrappers.TorchBeastEnv,
+    )
+
+    with lock:
+        env = gym.make(env_name)
+        # create_meltingpot_env(env_name)
+        for w in wrp:
+            env = w(env)
+    return env
 
 
 def serve(env_name, server_address):

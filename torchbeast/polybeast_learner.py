@@ -29,6 +29,7 @@ from torch.nn import functional as F
 from torchbeast.core import file_writer
 from torchbeast.core import vtrace
 
+from torchbeast.core.model import FCNet
 
 # Necessary for multithreading.
 os.environ["OMP_NUM_THREADS"] = "1"
@@ -59,9 +60,9 @@ parser.add_argument("--batch_size", default=8, type=int, metavar="B",
                     help="Learner batch size.")
 parser.add_argument("--unroll_length", default=80, type=int, metavar="T",
                     help="The unroll length (time dimension).")
-parser.add_argument("--num_learner_threads", default=2, type=int,
+parser.add_argument("--num_learner_threads", default=1, type=int,
                     metavar="N", help="Number learner threads.")
-parser.add_argument("--num_inference_threads", default=2, type=int,
+parser.add_argument("--num_inference_threads", default=1, type=int,
                     metavar="N", help="Number learner threads.")
 parser.add_argument("--disable_cuda", action="store_true",
                     help="Disable CUDA.")
@@ -79,7 +80,7 @@ parser.add_argument("--baseline_cost", default=0.5, type=float,
                     help="Baseline cost/multiplier.")
 parser.add_argument("--discounting", default=0.99, type=float,
                     help="Discounting factor.")
-parser.add_argument("--reward_clipping", default="abs_one",
+parser.add_argument("--reward_clipping", default="none",
                     choices=["abs_one", "none"],
                     help="Reward clipping.")
 
@@ -131,162 +132,26 @@ def compute_policy_gradient_loss(logits, actions, advantages):
     return torch.sum(cross_entropy * advantages.detach())
 
 
-class Net(nn.Module):
-    def __init__(self, num_actions, use_lstm=False):
-        super(Net, self).__init__()
-        self.num_actions = num_actions
-        self.use_lstm = use_lstm
-
-        self.feat_convs = []
-        self.resnet1 = []
-        self.resnet2 = []
-
-        self.convs = []
-
-        input_channels = 4
-        for num_ch in [16, 32, 32]:
-            feats_convs = []
-            feats_convs.append(
-                nn.Conv2d(
-                    in_channels=input_channels,
-                    out_channels=num_ch,
-                    kernel_size=3,
-                    stride=1,
-                    padding=1,
-                )
-            )
-            feats_convs.append(nn.MaxPool2d(kernel_size=3, stride=2, padding=1))
-            self.feat_convs.append(nn.Sequential(*feats_convs))
-
-            input_channels = num_ch
-
-            for i in range(2):
-                resnet_block = []
-                resnet_block.append(nn.ReLU())
-                resnet_block.append(
-                    nn.Conv2d(
-                        in_channels=input_channels,
-                        out_channels=num_ch,
-                        kernel_size=3,
-                        stride=1,
-                        padding=1,
-                    )
-                )
-                resnet_block.append(nn.ReLU())
-                resnet_block.append(
-                    nn.Conv2d(
-                        in_channels=input_channels,
-                        out_channels=num_ch,
-                        kernel_size=3,
-                        stride=1,
-                        padding=1,
-                    )
-                )
-                if i == 0:
-                    self.resnet1.append(nn.Sequential(*resnet_block))
-                else:
-                    self.resnet2.append(nn.Sequential(*resnet_block))
-
-        self.feat_convs = nn.ModuleList(self.feat_convs)
-        self.resnet1 = nn.ModuleList(self.resnet1)
-        self.resnet2 = nn.ModuleList(self.resnet2)
-
-        self.fc = nn.Linear(3872, 256)
-
-        # FC output size + last reward.
-        core_output_size = self.fc.out_features + 1
-
-        if use_lstm:
-            self.core = nn.LSTM(core_output_size, 256, num_layers=1)
-            core_output_size = 256
-
-        self.policy = nn.Linear(core_output_size, self.num_actions)
-        self.baseline = nn.Linear(core_output_size, 1)
-
-    def initial_state(self, batch_size=1):
-        if not self.use_lstm:
-            return tuple()
-        return tuple(
-            torch.zeros(self.core.num_layers, batch_size, self.core.hidden_size)
-            for _ in range(2)
-        )
-
-    def forward(self, inputs, core_state):
-        x = inputs["frame"]
-        T, B, *_ = x.shape
-        x = torch.flatten(x, 0, 1)  # Merge time and batch.
-        x = x.float() / 255.0
-
-        res_input = None
-        for i, fconv in enumerate(self.feat_convs):
-            x = fconv(x)
-            res_input = x
-            x = self.resnet1[i](x)
-            x += res_input
-            res_input = x
-            x = self.resnet2[i](x)
-            x += res_input
-
-        x = F.relu(x)
-        x = x.view(T * B, -1)
-        x = F.relu(self.fc(x))
-
-        clipped_reward = torch.clamp(inputs["reward"], -1, 1).view(T * B, 1)
-        core_input = torch.cat([x, clipped_reward], dim=-1)
-
-        if self.use_lstm:
-            core_input = core_input.view(T, B, -1)
-            core_output_list = []
-            notdone = (~inputs["done"]).float()
-            for input, nd in zip(core_input.unbind(), notdone.unbind()):
-                # Reset core state to zero whenever an episode ended.
-                # Make `done` broadcastable with (num_layers, B, hidden_size)
-                # states:
-                nd = nd.view(1, -1, 1)
-                core_state = nest.map(nd.mul, core_state)
-                output, core_state = self.core(input.unsqueeze(0), core_state)
-                core_output_list.append(output)
-            core_output = torch.flatten(torch.cat(core_output_list), 0, 1)
-        else:
-            core_output = core_input
-
-        policy_logits = self.policy(core_output)
-        baseline = self.baseline(core_output)
-
-        if self.training:
-            action = torch.multinomial(F.softmax(policy_logits, dim=1), num_samples=1)
-        else:
-            # Don't sample when testing.
-            action = torch.argmax(policy_logits, dim=1)
-
-        policy_logits = policy_logits.view(T, B, self.num_actions)
-        baseline = baseline.view(T, B)
-        action = action.view(T, B)
-
-        return (action, policy_logits, baseline), core_state
-
-
 def inference(flags, inference_batcher, model, lock=threading.Lock()):  # noqa: B008
     with torch.no_grad():
         for batch in inference_batcher:
             batched_env_outputs, agent_state = batch.get_inputs()
-            frame, reward, done, *_ = batched_env_outputs
-            frame = frame.to(flags.actor_device, non_blocking=True)
-            reward = reward.to(flags.actor_device, non_blocking=True)
-            done = done.to(flags.actor_device, non_blocking=True)
-            agent_state = nest.map(
-                lambda t: t.to(flags.actor_device, non_blocking=True), agent_state
+            observation, reward, done, *_ = batched_env_outputs
+
+            observation, agent_state = nest.map(
+                lambda t: t.to(flags.actor_device, non_blocking=True),
+                (observation, agent_state),
             )
             with lock:
-                outputs = model(
-                    dict(frame=frame, reward=reward, done=done), agent_state
-                )
-            outputs = nest.map(lambda t: t.cpu(), outputs)
+                outputs = model(observation, agent_state)
+            core_outputs, agent_state = nest.map(lambda t: t.cpu(), outputs)
+
+            outputs = (core_outputs, agent_state)
             batch.set_outputs(outputs)
 
 
 EnvOutput = collections.namedtuple(
-    "EnvOutput", "frame rewards done episode_step episode_return"
+    "EnvOutput", "observations rewards done episode_step episode_return"
 )
 AgentOutput = collections.namedtuple("AgentOutput", "action policy_logits baseline")
 Batch = collections.namedtuple("Batch", "env agent")
@@ -308,16 +173,21 @@ def learn(
 
         batch, initial_agent_state = tensors
         env_outputs, actor_outputs = batch
-        frame, reward, done, *_ = env_outputs
+        observation, _, _, *_ = env_outputs
 
         lock.acquire()  # Only one thread learning at a time.
         learner_outputs, unused_state = model(
-            dict(frame=frame, reward=reward, done=done), initial_agent_state
+            observation, initial_agent_state
         )
 
+        total_loss = 0
+                
         # Take final value function slice for bootstrapping.
         learner_outputs = AgentOutput._make(learner_outputs)
-        bootstrap_value = learner_outputs.baseline[-1]
+
+        bootstrap_value = [b[-1] for b in learner_outputs.baseline]
+
+        rewards = observation["rew"][1:, :, :]
 
         # Move from obs[t] -> action[t] to action[t] -> obs[t].
         batch = nest.map(lambda t: t[1:], batch)
@@ -329,36 +199,39 @@ def learn(
         actor_outputs = AgentOutput._make(actor_outputs)
         learner_outputs = AgentOutput._make(learner_outputs)
 
-        if flags.reward_clipping == "abs_one":
-            clipped_rewards = torch.clamp(env_outputs.rewards, -1, 1)
-        elif flags.reward_clipping == "none":
-            clipped_rewards = env_outputs.rewards
+        for agent in range(model.n_agents):
 
-        discounts = (~env_outputs.done).float() * flags.discounting
+            agent_rewards = rewards[:, :, agent]
+            if flags.reward_clipping == "abs_one":
+                clipped_rewards = torch.clamp(agent_rewards, -1, 1)
+            elif flags.reward_clipping == "none":
+                clipped_rewards = agent_rewards
 
-        vtrace_returns = vtrace.from_logits(
-            behavior_policy_logits=actor_outputs.policy_logits,
-            target_policy_logits=learner_outputs.policy_logits,
-            actions=actor_outputs.action,
-            discounts=discounts,
-            rewards=clipped_rewards,
-            values=learner_outputs.baseline,
-            bootstrap_value=bootstrap_value,
-        )
+            discounts = (~env_outputs.done).float() * flags.discounting
 
-        pg_loss = compute_policy_gradient_loss(
-            learner_outputs.policy_logits,
-            actor_outputs.action,
-            vtrace_returns.pg_advantages,
-        )
-        baseline_loss = flags.baseline_cost * compute_baseline_loss(
-            vtrace_returns.vs - learner_outputs.baseline
-        )
-        entropy_loss = flags.entropy_cost * compute_entropy_loss(
-            learner_outputs.policy_logits
-        )
+            vtrace_returns = vtrace.from_logits(
+                behavior_policy_logits=actor_outputs.policy_logits[agent],
+                target_policy_logits=learner_outputs.policy_logits[agent],
+                actions=actor_outputs.action[agent].squeeze(),
+                discounts=discounts,
+                rewards=clipped_rewards,
+                values=learner_outputs.baseline[agent].squeeze(),
+                bootstrap_value=bootstrap_value[agent].squeeze(),
+            )
 
-        total_loss = pg_loss + baseline_loss + entropy_loss
+            pg_loss = compute_policy_gradient_loss(
+                learner_outputs.policy_logits[agent],
+                actor_outputs.action[agent].squeeze(),
+                vtrace_returns.pg_advantages,
+            )
+            baseline_loss = flags.baseline_cost * compute_baseline_loss(
+                vtrace_returns.vs - learner_outputs.baseline[agent].squeeze()
+            )
+            entropy_loss = flags.entropy_cost * compute_entropy_loss(
+                learner_outputs.policy_logits[agent]
+            )
+
+            total_loss += pg_loss + baseline_loss + entropy_loss
 
         optimizer.zero_grad()
         total_loss.backward()
@@ -443,10 +316,12 @@ def train(flags):
                 break
         pipe_id += 1
 
-    model = Net(num_actions=flags.num_actions, use_lstm=flags.use_lstm)
+    import gym
+    test_env = gym.make(flags.env)
+    model = FCNet(test_env.observation_space, test_env.action_space, use_lstm=flags.use_lstm)
     model = model.to(device=flags.learner_device)
 
-    actor_model = Net(num_actions=flags.num_actions, use_lstm=flags.use_lstm)
+    actor_model = FCNet(test_env.observation_space, test_env.action_space, use_lstm=flags.use_lstm)
     actor_model.to(device=flags.actor_device)
 
     # The ActorPool that will run `flags.num_actors` many loops.
@@ -469,12 +344,19 @@ def train(flags):
 
     actorpool_thread = threading.Thread(target=run, name="actorpool-thread")
 
-    optimizer = torch.optim.RMSprop(
+    # optimizer = torch.optim.RMSprop(
+    #     model.parameters(),
+    #     lr=flags.learning_rate,
+    #     momentum=flags.momentum,
+    #     eps=flags.epsilon,
+    #     alpha=flags.alpha,
+    # )
+    optimizer = torch.optim.Adam(
         model.parameters(),
-        lr=flags.learning_rate,
-        momentum=flags.momentum,
-        eps=flags.epsilon,
-        alpha=flags.alpha,
+        lr=3e-4,
+        # momentum=flags.momentum,
+        # eps=flags.epsilon,
+        # alpha=flags.alpha,
     )
 
     def lr_lambda(epoch):
